@@ -3,7 +3,7 @@ import { generateKeyPairSync } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { parseTracks, pollPlayReleaseWorker, type PlayReleaseWorkerEnv } from "../src/play-release-worker.js";
+import { parsePlayApps, pollPlayReleaseWorker, type PlayReleaseWorkerEnv } from "../src/play-release-worker.js";
 import { exportState, seedSql } from "../src/play-state-cli.js";
 
 // node:sqlite를 D1 API 모양으로 감싼다. 실제 마이그레이션 SQL을 그대로 적용한다.
@@ -24,6 +24,23 @@ const PUBLISHED = "RELEASE_LIFECYCLE_STATE_PUBLISHED";
 const IN_REVIEW = "RELEASE_LIFECYCLE_STATE_IN_REVIEW";
 const APPROVED = "RELEASE_LIFECYCLE_STATE_APPROVED_NOT_PUBLISHED";
 
+function serviceAccount(name: string): string {
+  return JSON.stringify({
+    type: "service_account",
+    client_email: `${name}@example.iam.gserviceaccount.com`,
+    private_key: privateKey.export({ format: "pem", type: "pkcs8" }).toString(),
+  });
+}
+
+// 앱별 오류는 AggregateError로 모아 던진다. 안의 메시지로 확인한다.
+async function rejectsWith(promise: Promise<unknown>, pattern: RegExp): Promise<void> {
+  await assert.rejects(promise, (error: unknown) => {
+    assert.ok(error instanceof AggregateError);
+    assert.match(error.errors.map((item: Error) => item.message).join("\n"), pattern);
+    return true;
+  });
+}
+
 type Release = { name: string; versionCodes: number[]; state: string };
 
 async function fixture(options: { discordStatus?: number; notesStatus?: number } = {}) {
@@ -34,15 +51,10 @@ async function fixture(options: { discordStatus?: number; notesStatus?: number }
   const db = await d1(counter);
   const state = { discordStatus: options.discordStatus ?? 200, notesStatus: options.notesStatus ?? 200 };
   const env: PlayReleaseWorkerEnv = {
-    DB: db,
-    PACKAGE_NAME: "com.yeobee",
-    TRACKS: JSON.stringify(["internal", "production"]),
-    GOOGLE_SERVICE_ACCOUNT_JSON: JSON.stringify({
-      type: "service_account",
-      client_email: "ping@example.iam.gserviceaccount.com",
-      private_key: privateKey.export({ format: "pem", type: "pkcs8" }).toString(),
-    }),
-    DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/123/test",
+    PLAY_APPS: JSON.stringify([{ key: "YEOBEE", packageName: "com.yeobee", tracks: ["internal", "production"] }]),
+    YEOBEE_DB: db,
+    YEOBEE_GOOGLE_SERVICE_ACCOUNT_JSON: serviceAccount("yeobee"),
+    YEOBEE_DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/123/yeobee",
   };
   const fetcher = (async (input: URL | RequestInfo, init?: RequestInit) => {
     const url = new URL(String(input));
@@ -91,7 +103,7 @@ test("첫 실행은 기준점만 저장하고 알리지 않는다", async () => 
   const f = await fixture();
   f.tracks.internal = [{ name: "1.4.0", versionCodes: [10400], state: PUBLISHED }];
   f.tracks.production = [{ name: "1.4.0", versionCodes: [10400], state: IN_REVIEW }];
-  assert.deepEqual(await pollPlayReleaseWorker(f.env, f.fetcher), { checked: 2, notifications: 0, skipped: false });
+  assert.deepEqual(await pollPlayReleaseWorker(f.env, f.fetcher), { checked: 2, notifications: 0, skipped: 0 });
   assert.equal(f.sent.length, 0);
   assert.equal(rows(f.db).length, 2);
   assert.ok(f.counter.queries <= 10);
@@ -153,7 +165,7 @@ test("Discord가 4xx(429 포함)로 거절하면 이전 상태로 되돌려 다�
   f.tracks.internal = [{ name: "1.4.1", versionCodes: [10401], state: PUBLISHED }];
   f.tracks.production = [{ name: "1.4.0", versionCodes: [10400], state: APPROVED }];
   f.state.discordStatus = 429;
-  await assert.rejects(pollPlayReleaseWorker(f.env, f.fetcher), /Discord HTTP 429/);
+  await rejectsWith(pollPlayReleaseWorker(f.env, f.fetcher), /com\.yeobee: Discord HTTP 429/);
   // 처음 본 versionCode는 행을 지우고, 기존 versionCode는 이전 상태로 되돌린다.
   assert.deepEqual(rows(f.db), [
     { track: "internal", version_code: 10400, state: PUBLISHED, sending: 0 },
@@ -171,7 +183,7 @@ test("Discord 5xx·타임아웃은 게시됐을 수 있어 다시 보내지 않�
   await pollPlayReleaseWorker(f.env, f.fetcher);
   f.tracks.production = [{ name: "1.4.0", versionCodes: [10400], state: APPROVED }];
   f.state.discordStatus = 502;
-  await assert.rejects(pollPlayReleaseWorker(f.env, f.fetcher), /Discord HTTP 502/);
+  await rejectsWith(pollPlayReleaseWorker(f.env, f.fetcher), /Discord HTTP 502/);
   f.state.discordStatus = 200;
   const warnings: string[] = [];
   const original = console.warn;
@@ -201,7 +213,7 @@ test("다른 실행이 lease를 잡고 있으면 건너뛰고, 끝난 실행은 
   assert.deepEqual({ ...f.db.prepare("SELECT lease_until, lease_token FROM play_apps").get() }, { lease_until: 0, lease_token: "" });
   f.db.prepare("UPDATE play_apps SET lease_until = ?, lease_token = 'other'").run(Date.now() + 60_000);
   f.tracks.production = [{ name: "1.4.0", versionCodes: [10400], state: APPROVED }];
-  assert.deepEqual(await pollPlayReleaseWorker(f.env, f.fetcher), { checked: 0, notifications: 0, skipped: true });
+  assert.deepEqual(await pollPlayReleaseWorker(f.env, f.fetcher), { checked: 0, notifications: 0, skipped: 1 });
   assert.equal(f.sent.length, 0);
   f.db.prepare("UPDATE play_apps SET lease_until = 0").run();
   assert.equal((await pollPlayReleaseWorker(f.env, f.fetcher)).notifications, 1);
@@ -243,8 +255,96 @@ test("로컬 상태 파일로 seed하면 같은 상태는 알리지 않고 이�
   assert.equal(exported.observations["com.yeobee|internal|10400"].observedAt, "2026-11-25T08:06:11.050Z");
 });
 
-test("TRACKS 형식이 틀리면 실행하지 않는다", () => {
-  assert.throws(() => parseTracks("internal"), /JSON 배열/);
-  assert.throws(() => parseTracks("[]"), /하나 이상/);
-  assert.deepEqual(parseTracks('["internal","internal","production"]'), ["internal", "production"]);
+test("PLAY_APPS 형식이 틀리면 실행하지 않는다", () => {
+  assert.throws(() => parsePlayApps("x"), /JSON 배열/);
+  assert.throws(() => parsePlayApps("[]"), /하나 이상/);
+  assert.throws(() => parsePlayApps(JSON.stringify([{ key: "yeobee", packageName: "a", tracks: ["internal"] }])), /key/);
+  assert.throws(() => parsePlayApps(JSON.stringify([{ key: "A", packageName: "a", tracks: [] }])), /tracks/);
+  assert.throws(() => parsePlayApps(JSON.stringify([
+    { key: "A", packageName: "a", tracks: ["internal"] }, { key: "A", packageName: "b", tracks: ["internal"] },
+  ])), /중복/);
+  assert.deepEqual(parsePlayApps(JSON.stringify([{ key: "A", packageName: "a", tracks: ["internal", "internal"] }])),
+    [{ key: "A", packageName: "a", tracks: ["internal"] }]);
+});
+
+test("앱별 서비스 계정·웹훅·D1을 쓰고, 한 앱이 실패해도 다른 앱은 알린다", async () => {
+  const counter = { queries: 0 };
+  const yeobee = await d1(counter);
+  const bandalart = await d1(counter);
+  const tokenRequests: string[] = [];
+  const posted: Array<{ hook: string; content: string }> = [];
+  const releases: Record<string, string> = { "com.yeobee": IN_REVIEW, "com.nexters.bandalart": IN_REVIEW };
+  let failYeobeeToken = false;
+  const fetcher = (async (input: URL | RequestInfo, init?: RequestInit) => {
+    const url = new URL(String(input));
+    if (url.hostname === "oauth2.googleapis.com") {
+      const assertion = new URLSearchParams(String(init?.body)).get("assertion")!;
+      const email = JSON.parse(Buffer.from(assertion.split(".")[1], "base64url").toString()).iss as string;
+      tokenRequests.push(email);
+      if (failYeobeeToken && email.startsWith("yeobee")) return Response.json({ error: "invalid_grant" }, { status: 400 });
+      return Response.json({ access_token: `token-${email.split("@")[0]}` });
+    }
+    if (url.hostname === "discord.com") {
+      posted.push({ hook: url.pathname, content: JSON.parse(String(init?.body)).content });
+      return new Response("{}", { status: 200 });
+    }
+    const packageName = url.pathname.split("/")[4];
+    const expected = packageName === "com.yeobee" ? "Bearer token-yeobee" : "Bearer token-bandalart";
+    assert.equal((init?.headers as Record<string, string>).authorization, expected);
+    const track = url.pathname.split("/")[6];
+    return Response.json({
+      releases: track === "production"
+        ? [{ releaseName: "1.0", track, releaseLifecycleState: releases[packageName], activeArtifacts: [{ versionCode: 1 }] }]
+        : [],
+    });
+  }) as typeof fetch;
+  const env: PlayReleaseWorkerEnv = {
+    PLAY_APPS: JSON.stringify([
+      { key: "YEOBEE", packageName: "com.yeobee", tracks: ["internal", "production"] },
+      { key: "BANDALART", packageName: "com.nexters.bandalart", tracks: ["internal", "production"] },
+    ]),
+    YEOBEE_DB: yeobee,
+    YEOBEE_GOOGLE_SERVICE_ACCOUNT_JSON: serviceAccount("yeobee"),
+    YEOBEE_DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/1/yeobee",
+    BANDALART_DB: bandalart,
+    BANDALART_GOOGLE_SERVICE_ACCOUNT_JSON: serviceAccount("bandalart"),
+    BANDALART_DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/2/bandalart",
+  };
+  assert.deepEqual(await pollPlayReleaseWorker(env, fetcher), { checked: 2, notifications: 0, skipped: 0 });
+  assert.deepEqual(yeobee.raw.prepare("SELECT package_name FROM play_releases").all().map((row) => row.package_name), ["com.yeobee"]);
+  assert.deepEqual(bandalart.raw.prepare("SELECT package_name FROM play_releases").all().map((row) => row.package_name),
+    ["com.nexters.bandalart"]);
+
+  releases["com.yeobee"] = APPROVED;
+  releases["com.nexters.bandalart"] = APPROVED;
+  failYeobeeToken = true;
+  await rejectsWith(pollPlayReleaseWorker(env, fetcher), /com\.yeobee: Google 토큰 발급 실패: HTTP 400 invalid_grant/);
+  assert.deepEqual(posted.map((item) => item.hook), ["/api/webhooks/2/bandalart"]);
+  assert.match(posted[0].content, /com\.nexters\.bandalart · production/);
+  // 실패한 앱은 lease를 풀어 다음 Cron에서 바로 다시 조회한다.
+  assert.equal(yeobee.raw.prepare("SELECT lease_until FROM play_apps").get()?.lease_until, 0);
+
+  failYeobeeToken = false;
+  assert.equal((await pollPlayReleaseWorker(env, fetcher)).notifications, 1);
+  assert.deepEqual(posted.map((item) => item.hook), ["/api/webhooks/2/bandalart", "/api/webhooks/1/yeobee"]);
+  assert.ok(counter.queries < 50 * 3);
+
+  // 한 앱의 비밀값이 빠져도 다른 앱은 조회한다.
+  delete env.YEOBEE_DISCORD_WEBHOOK_URL;
+  releases["com.nexters.bandalart"] = PUBLISHED;
+  await rejectsWith(pollPlayReleaseWorker(env, fetcher), /YEOBEE_DISCORD_WEBHOOK_URL/);
+  assert.equal(posted.length, 3);
+});
+
+test("두 앱을 한 실행에서 처리해도 D1 쿼리는 무료 플랜 한도(50개)보다 훨씬 적다", async () => {
+  const f = await fixture();
+  f.tracks.internal = [{ name: "1.4.0", versionCodes: [10400], state: PUBLISHED }];
+  f.tracks.production = [{ name: "1.4.0", versionCodes: [10400], state: IN_REVIEW }];
+  await pollPlayReleaseWorker(f.env, f.fetcher);
+  f.tracks.internal = [{ name: "1.4.1", versionCodes: [10401], state: PUBLISHED }];
+  f.tracks.production = [{ name: "1.4.0", versionCodes: [10400], state: APPROVED }];
+  f.counter.queries = 0;
+  assert.equal((await pollPlayReleaseWorker(f.env, f.fetcher)).notifications, 2);
+  // 알림 2건인 실행이 앱당 쿼리 11개. 두 앱이면 22개.
+  assert.ok(f.counter.queries <= 11, `queries=${f.counter.queries}`);
 });

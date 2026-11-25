@@ -5,7 +5,9 @@ import {
   type ReleaseNote, type ReleaseObservation,
 } from "./play-format.js";
 
-// 로컬 `pnpm watch`(src/poller.ts)를 Cron Trigger와 D1로 옮긴 것이다. 앱 하나당 Worker 하나를 띄운다.
+// 로컬 `pnpm watch`(src/poller.ts)를 Cron Trigger와 D1로 옮긴 것이다. Worker 하나가 여러 앱을 조회한다.
+// 무료 플랜은 계정당 Cron Trigger가 5개라 앱마다 Worker를 두지 않는다. 대신 서비스 계정, Discord 웹훅, D1을
+// 앱별 비밀값·바인딩으로 나누고, lease와 오류도 앱별로 처리해 한 앱의 실패가 다른 앱 알림을 막지 않게 한다.
 // 상태 파일 대신 D1의 play_releases(packageName·track·versionCode별 마지막 상태)와 play_apps(lease)를 쓴다.
 // Google Play에는 심사 상태 웹훅이 없어(RTDN은 결제 전용) Cron 조회만 한다.
 
@@ -16,18 +18,32 @@ interface Statement {
   run(): Promise<{ meta: { changes: number } }>;
 }
 
-interface Database {
+export interface Database {
   prepare(sql: string): Statement;
 }
 
 export interface PlayReleaseWorkerEnv {
-  DB: Database;
-  PACKAGE_NAME: string;
-  /** JSON 배열. 예: ["internal","production"] */
-  TRACKS: string;
-  /** 서비스 계정 JSON 키 파일 내용 전체 */
-  GOOGLE_SERVICE_ACCOUNT_JSON: string;
-  DISCORD_WEBHOOK_URL: string;
+  /**
+   * JSON 배열. 앱마다 key를 정하면 `${key}_DB`(D1 바인딩), `${key}_GOOGLE_SERVICE_ACCOUNT_JSON`(서비스 계정
+   * JSON 키 파일 내용), `${key}_DISCORD_WEBHOOK_URL`(비밀값)을 읽는다.
+   * 예: [{"key":"YEOBEE","packageName":"com.yeobee","tracks":["internal","production"]}]
+   */
+  PLAY_APPS: string;
+  [binding: string]: unknown;
+}
+
+export interface PlayAppConfig {
+  key: string;
+  packageName: string;
+  tracks: string[];
+}
+
+interface PlayApp {
+  db: Database;
+  packageName: string;
+  tracks: string[];
+  serviceAccountJson: string;
+  discordWebhookUrl: string;
 }
 
 interface StoredRow {
@@ -43,35 +59,83 @@ const REQUEST_TIMEOUT_MS = 15_000;
 // 한 실행은 Google 조회(15초 제한) 몇 번과 Discord 전송이 전부라 5분이면 넉넉하다. 15분 Cron과도 겹치지 않는다.
 const LEASE_MS = 300_000;
 
-export function parseTracks(raw: string): string[] {
-  let tracks: unknown;
+export function parsePlayApps(raw: string): PlayAppConfig[] {
+  let apps: unknown;
   try {
-    tracks = JSON.parse(raw);
+    apps = JSON.parse(raw);
   } catch {
-    throw new Error("TRACKS는 JSON 배열이어야 합니다.");
+    throw new Error("PLAY_APPS는 JSON 배열이어야 합니다.");
   }
-  if (!Array.isArray(tracks) || tracks.length === 0 ||
-      !tracks.every((track) => typeof track === "string" && /^[A-Za-z0-9:_-]+$/.test(track))) {
-    throw new Error("TRACKS에는 트랙 이름이 하나 이상 필요합니다.");
+  if (!Array.isArray(apps) || apps.length === 0) throw new Error("PLAY_APPS에는 앱이 하나 이상 필요합니다.");
+  const parsed = apps.map((value, index) => {
+    const app = (value ?? {}) as Record<string, unknown>;
+    if (typeof app.key !== "string" || !/^[A-Z][A-Z0-9_]*$/.test(app.key)) {
+      throw new Error(`PLAY_APPS[${index}].key는 대문자 환경 변수 접두어여야 합니다.`);
+    }
+    if (typeof app.packageName !== "string" || !/^[A-Za-z0-9_.]+$/.test(app.packageName)) {
+      throw new Error(`PLAY_APPS[${index}].packageName이 올바르지 않습니다.`);
+    }
+    const tracks = app.tracks;
+    if (!Array.isArray(tracks) || tracks.length === 0 ||
+        !tracks.every((track) => typeof track === "string" && /^[A-Za-z0-9:_-]+$/.test(track))) {
+      throw new Error(`PLAY_APPS[${index}].tracks에는 트랙 이름이 하나 이상 필요합니다.`);
+    }
+    return { key: app.key, packageName: app.packageName, tracks: [...new Set(tracks as string[])] };
+  });
+  if (new Set(parsed.map((app) => app.key)).size !== parsed.length ||
+      new Set(parsed.map((app) => app.packageName)).size !== parsed.length) {
+    throw new Error("PLAY_APPS에 같은 key나 packageName이 중복되었습니다.");
   }
-  return [...new Set(tracks as string[])];
+  return parsed;
 }
 
 export async function pollPlayReleaseWorker(
   env: PlayReleaseWorkerEnv, fetcher: typeof fetch = fetch,
-): Promise<{ checked: number; notifications: number; skipped: boolean }> {
-  if (!env.DB || !env.PACKAGE_NAME?.trim() || !env.DISCORD_WEBHOOK_URL || !env.GOOGLE_SERVICE_ACCOUNT_JSON) {
-    throw new Error("Play 심사 Worker 설정이 빠졌습니다.");
+): Promise<{ checked: number; notifications: number; skipped: number }> {
+  const apps = parsePlayApps(env.PLAY_APPS);
+  let checked = 0;
+  let notifications = 0;
+  let skipped = 0;
+  const errors: unknown[] = [];
+  // 앱 하나의 실패(키 만료, 할당량, Discord 오류)가 다른 앱 알림을 막지 않도록 앱별로 처리하고, 실패는 끝에서 모아 던진다.
+  for (const config of apps) {
+    try {
+      const result = await pollApp(resolveApp(env, config), fetcher);
+      checked += result.checked;
+      notifications += result.notifications;
+      skipped += result.skipped ? 1 : 0;
+    } catch (error) {
+      errors.push(new Error(`${config.packageName}: ${error instanceof Error ? error.message : String(error)}`));
+    }
   }
-  const packageName = env.PACKAGE_NAME;
-  const tracks = parseTracks(env.TRACKS);
-  const account = parseServiceAccount(env.GOOGLE_SERVICE_ACCOUNT_JSON);
+  if (errors.length > 0) {
+    throw new AggregateError(errors, `Play 조회 실패 ${errors.length}건 (알림 ${notifications}건 전송)`);
+  }
+  return { checked, notifications, skipped };
+}
+
+function resolveApp(env: PlayReleaseWorkerEnv, config: PlayAppConfig): PlayApp {
+  const db = env[`${config.key}_DB`] as Database | undefined;
+  const serviceAccountJson = env[`${config.key}_GOOGLE_SERVICE_ACCOUNT_JSON`];
+  const discordWebhookUrl = env[`${config.key}_DISCORD_WEBHOOK_URL`];
+  if (!db || typeof db.prepare !== "function" || typeof serviceAccountJson !== "string" || !serviceAccountJson ||
+      typeof discordWebhookUrl !== "string" || !discordWebhookUrl) {
+    throw new Error(`${config.key}_DB, ${config.key}_GOOGLE_SERVICE_ACCOUNT_JSON, ${config.key}_DISCORD_WEBHOOK_URL 중 빠진 설정이 있습니다.`);
+  }
+  return { db, packageName: config.packageName, tracks: config.tracks, serviceAccountJson, discordWebhookUrl };
+}
+
+async function pollApp(
+  app: PlayApp, fetcher: typeof fetch,
+): Promise<{ checked: number; notifications: number; skipped: boolean }> {
+  const { packageName, tracks } = app;
+  const account = parseServiceAccount(app.serviceAccountJson);
 
   // 실행이 겹치면(수동 실행, 이전 실행 지연) 같은 전환을 두 번 보낸다. lease를 못 잡으면 다른 실행에 맡긴다.
   const token = crypto.randomUUID();
   const now = Date.now();
-  await env.DB.prepare("INSERT OR IGNORE INTO play_apps (package_name) VALUES (?)").bind(packageName).run();
-  const claimed = await env.DB.prepare(
+  await app.db.prepare("INSERT OR IGNORE INTO play_apps (package_name) VALUES (?)").bind(packageName).run();
+  const claimed = await app.db.prepare(
     "UPDATE play_apps SET lease_until = ?, lease_token = ? WHERE package_name = ? AND lease_until < ?",
   ).bind(now + LEASE_MS, token, packageName, now).run();
   if (claimed.meta.changes === 0) return { checked: 0, notifications: 0, skipped: true };
@@ -95,7 +159,7 @@ export async function pollPlayReleaseWorker(
       packageName, track,
     )))).flat());
 
-    const rows = (await env.DB.prepare(
+    const rows = (await app.db.prepare(
       "SELECT track, version_code, state, sending FROM play_releases WHERE package_name = ?",
     ).bind(packageName).all<StoredRow>()).results;
     const stored = new Map(rows.map((row) => [releaseKey(row.track, row.version_code), row]));
@@ -116,7 +180,7 @@ export async function pollPlayReleaseWorker(
       if (!notification) continue;
 
       // 실행이 길어져 lease가 만료되면 다른 실행이 같은 전환을 보낼 수 있다. 보내기 전마다 연장하고, 뺏겼으면 멈춘다.
-      const renewed = await env.DB.prepare(
+      const renewed = await app.db.prepare(
         "UPDATE play_apps SET lease_until = ? WHERE package_name = ? AND lease_token = ?",
       ).bind(Date.now() + LEASE_MS, packageName, token).run();
       if (renewed.meta.changes === 0) {
@@ -129,7 +193,7 @@ export async function pollPlayReleaseWorker(
         : [];
       // 보내기 전에 새 상태와 sending = 1을 기록한다. 전송 후 기록 전에 실행이 잘려도 다음 실행이
       // 같은 전환을 다시 보내지 않는다(중복보다 누락을 택한다). 잘리면 sending = 1로 남아 다음 실행이 경고한다.
-      await env.DB.prepare(
+      await app.db.prepare(
         `INSERT INTO play_releases
            (package_name, track, version_code, state, release_name, observed_at, sending, previous_state)
          VALUES (?, ?, ?, ?, ?, ?, 1, ?)
@@ -139,16 +203,16 @@ export async function pollPlayReleaseWorker(
       ).bind(packageName, observation.track, observation.versionCode, observation.state,
         observation.releaseName, new Date().toISOString(), previous).run();
       try {
-        await sendDiscord(env.DISCORD_WEBHOOK_URL, formatMessage({
+        await sendDiscord(app.discordWebhookUrl, formatMessage({
           kind: notification, previous, release: observation, releaseNotes,
         }), fetcher);
       } catch (error) {
         // Discord가 4xx로 거절한 것이 확실할 때만 이전 상태로 되돌려 다음 실행에서 다시 보낸다.
         // 타임아웃·네트워크 오류·5xx는 실제로 게시됐을 수 있어 sending = 1을 남긴다.
-        if (error instanceof DiscordRejected) await revert(env, observation, previous);
+        if (error instanceof DiscordRejected) await revert(app, observation, previous);
         throw error;
       }
-      await env.DB.prepare(
+      await app.db.prepare(
         `UPDATE play_releases SET sending = 0, previous_state = NULL
          WHERE package_name = ? AND track = ? AND version_code = ?`,
       ).bind(packageName, observation.track, observation.versionCode).run();
@@ -158,7 +222,7 @@ export async function pollPlayReleaseWorker(
     // 알림 없는 관측(첫 기준점, IN_REVIEW 등)은 한 쿼리로 저장한다. 무료 플랜은 실행당 D1 쿼리가 50개다.
     // 상태나 이름이 바뀐 행만 고쳐 D1 쓰기 수를 줄인다.
     if (observations.length > 0) {
-      await env.DB.prepare(
+      await app.db.prepare(
         `INSERT INTO play_releases (package_name, track, version_code, state, release_name, observed_at)
          SELECT ?, json_extract(value, '$.track'), json_extract(value, '$.versionCode'),
                 json_extract(value, '$.state'), json_extract(value, '$.releaseName'), ?
@@ -179,7 +243,7 @@ export async function pollPlayReleaseWorker(
   } finally {
     // 해제에 실패해도 원래 오류를 덮지 않는다. 남은 lease는 LEASE_MS 뒤 만료된다.
     try {
-      await env.DB.prepare(
+      await app.db.prepare(
         "UPDATE play_apps SET lease_until = 0, lease_token = '' WHERE package_name = ? AND lease_token = ?",
       ).bind(packageName, token).run();
     } catch (error) {
@@ -215,14 +279,14 @@ function releaseKey(track: string, versionCode: number): string {
 }
 
 async function revert(
-  env: PlayReleaseWorkerEnv, observation: ReleaseObservation, previous: LifecycleState | null,
+  app: PlayApp, observation: ReleaseObservation, previous: LifecycleState | null,
 ): Promise<void> {
   try {
     const where = "WHERE package_name = ? AND track = ? AND version_code = ? AND sending = 1";
-    const keys = [env.PACKAGE_NAME, observation.track, observation.versionCode];
+    const keys = [app.packageName, observation.track, observation.versionCode];
     await (previous === null
-      ? env.DB.prepare(`DELETE FROM play_releases ${where}`).bind(...keys)
-      : env.DB.prepare(`UPDATE play_releases SET state = ?, sending = 0, previous_state = NULL ${where}`)
+      ? app.db.prepare(`DELETE FROM play_releases ${where}`).bind(...keys)
+      : app.db.prepare(`UPDATE play_releases SET state = ?, sending = 0, previous_state = NULL ${where}`)
         .bind(previous, ...keys)).run();
   } catch (error) {
     console.error("Play sending 되돌리기 실패", error instanceof Error ? error.message : "unknown");
@@ -285,9 +349,12 @@ type WaitUntil = { waitUntil(promise: Promise<unknown>): void };
 async function runPoll(env: PlayReleaseWorkerEnv): Promise<void> {
   try {
     const result = await pollPlayReleaseWorker(env);
-    console.log(`Play ${env.PACKAGE_NAME} checked=${result.checked} notifications=${result.notifications} skipped=${result.skipped}`);
+    console.log(`Play checked=${result.checked} notifications=${result.notifications} skipped=${result.skipped}`);
   } catch (error) {
-    console.error(`Play ${env.PACKAGE_NAME} poll failed`, error instanceof Error ? error.message : "unknown");
+    const details = error instanceof AggregateError
+      ? error.errors.map((item) => item instanceof Error ? item.message : String(item)).join("; ")
+      : "";
+    console.error("Play poll failed", error instanceof Error ? error.message : "unknown", details);
     throw error;
   }
 }

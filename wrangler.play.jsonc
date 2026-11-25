@@ -1,0 +1,29 @@
+// 여비·반다라트 Google Play 심사 상태 알림. 무료 플랜은 계정당 Cron Trigger가 5개라 Worker 하나·Cron 하나로 두 앱을 조회한다.
+// 15분마다 internal·production 트랙의 releaseLifecycleState를 조회한다(할당량: docs/QUOTAS.md).
+// 앱별 비밀값: YEOBEE_GOOGLE_SERVICE_ACCOUNT_JSON, YEOBEE_DISCORD_WEBHOOK_URL,
+//              BANDALART_GOOGLE_SERVICE_ACCOUNT_JSON, BANDALART_DISCORD_WEBHOOK_URL
+// D1 테이블: migrations/0003_play_releases.sql. 반다라트 D1은 0001을 마이그레이션 기록 없이 만들어서
+// `d1 migrations apply`를 쓰지 않고 `d1 execute --file`로 0003만 적용한다(docs/PLAY_WORKER_OPERATIONS.md).
+{
+  "name": "play-release-ping",
+  "main": "src/play-release-worker.ts",
+  "compatibility_date": "2026-10-13",
+  "workers_dev": false,
+  "triggers": { "crons": ["*/15 * * * *"] },
+  "vars": {
+    "PLAY_APPS": "[{\"key\":\"YEOBEE\",\"packageName\":\"com.yeobee\",\"tracks\":[\"internal\",\"production\"]},{\"key\":\"BANDALART\",\"packageName\":\"com.nexters.bandalart\",\"tracks\":[\"internal\",\"production\"]}]"
+  },
+  "d1_databases": [
+    {
+      "binding": "YEOBEE_DB",
+      "database_name": "yeobee-ios-webhook-events",
+      "database_id": "6110acda-08f3-4b62-beff-e7fead574212",
+      "migrations_dir": "migrations"
+    },
+    {
+      "binding": "BANDALART_DB",
+      "database_name": "bandalart-ios-webhook-events",
+      "database_id": "4415c672-cf8c-4aff-9792-4952a45624c8"
+    }
+  ]
+}

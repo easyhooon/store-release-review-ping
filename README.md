@@ -4,7 +4,7 @@ Google Play와 App Store 앱 릴리스의 심사 상태를 감시하고 Slack, D
 
 Play Console 화면을 긁지 않고 공식 Google Play Developer API의 `releaseLifecycleState`를 사용합니다.
 
-여비·반다라트 운영 알림은 Mac의 `pnpm watch` 대신 앱별 Cloudflare Worker(Cron 15분 + D1, `src/play-release-worker.ts`)가 보냅니다. 배포, 상태 이전, 로컬로 되돌리는 방법은 [Play Worker 운영 문서](docs/PLAY_WORKER_OPERATIONS.md)를 참고하세요. 아래 로컬 실행 방법은 연동 검증과 Worker 장애 때의 대체 경로입니다.
+여비·반다라트 운영 알림은 Mac의 `pnpm watch` 대신 Cloudflare Worker 하나(Cron 15분 + 앱별 D1, `src/play-release-worker.ts`)가 보냅니다. 배포, 상태 이전, 로컬로 되돌리는 방법은 [Play Worker 운영 문서](docs/PLAY_WORKER_OPERATIONS.md)를 참고하세요. 아래 로컬 실행 방법은 연동 검증과 Worker 장애 때의 대체 경로입니다.
 
 반다라트 iOS App Store **심사 상태** 감시는 별도로 구현되어 있습니다. Apple 웹훅을 받는 Cloudflare Workers/D1 수신기가 알림을 담당합니다. 실제 Apple 이벤트와 Discord 전달을 확인해 2026-11-25에 15분 조회(`ios:watch`)를 중단했습니다. iOS **고객 후기** 알림과는 다른 흐름입니다. [구성도와 전환 절차](docs/IOS_WEBHOOK_ARCHITECTURE.md), [iOS 운영 문서](docs/IOS_STORE_OPERATIONS.md)를 참고하세요.
 
