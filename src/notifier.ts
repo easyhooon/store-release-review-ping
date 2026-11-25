@@ -3,12 +3,13 @@ import type {
   NotificationKind,
 } from "./domain/lifecycle.js";
 import type { AppConfig } from "./config.js";
-import type { ReleaseObservation } from "./google-play.js";
+import type { ReleaseNote, ReleaseObservation } from "./google-play.js";
 
 export interface NotificationEvent {
   kind: NotificationKind;
   previous: LifecycleState | null;
   release: ReleaseObservation;
+  releaseNotes?: ReleaseNote[];
 }
 
 export interface Notifier {
@@ -114,7 +115,15 @@ export function formatMessage(event: NotificationEvent): string {
   if (event.previous) {
     lines.push(`${shortState(event.previous)} → ${shortState(release.state)}`);
   }
+  const note = pickReleaseNote(event.releaseNotes ?? []);
+  if (note) {
+    lines.push("", "출시노트", note.text);
+  }
   return lines.join("\n");
+}
+
+function pickReleaseNote(notes: ReleaseNote[]): ReleaseNote | undefined {
+  return notes.find((note) => note.language === "ko-KR") ?? notes[0];
 }
 
 function createAppNotifiers(

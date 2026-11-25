@@ -3,7 +3,11 @@ import {
   observeLifecycle,
   type LifecycleState,
 } from "./domain/lifecycle.js";
-import type { GooglePlayClient, ReleaseObservation } from "./google-play.js";
+import type {
+  GooglePlayClient,
+  ReleaseNote,
+  ReleaseObservation,
+} from "./google-play.js";
 import {
   notifyAll,
   type Notifier,
@@ -18,7 +22,8 @@ export interface PollSummary {
 
 export async function pollOnce(
   config: Config,
-  client: Pick<GooglePlayClient, "listReleases">,
+  client: Pick<GooglePlayClient, "listReleases"> &
+    Partial<Pick<GooglePlayClient, "getReleaseNotes">>,
   resolveNotifiers: NotifierResolver,
 ): Promise<PollSummary> {
   const store = new FileStateStore(config.stateFile);
@@ -47,6 +52,7 @@ export async function pollOnce(
       observation,
       resolveNotifiers(observation.packageName),
       trackBaselines.get(trackKey(observation)) ?? false,
+      client,
     );
   }
 
@@ -59,6 +65,7 @@ async function processObservation(
   observation: ReleaseObservation,
   notifiers: Notifier[],
   trackHasBaseline: boolean,
+  client: Partial<Pick<GooglePlayClient, "getReleaseNotes">>,
 ): Promise<number> {
   const previous = store.get(observation)?.state ?? null;
   const decision = observeLifecycle(previous, observation.state);
@@ -75,6 +82,9 @@ async function processObservation(
       kind: notification,
       previous,
       release: observation,
+      releaseNotes: notification === "internal-deployed"
+        ? await fetchReleaseNotes(client, observation)
+        : [],
     });
   }
 
@@ -91,6 +101,28 @@ function isNewInternalDeployment(
     trackHasBaseline &&
     observation.track === "internal" &&
     observation.state === "RELEASE_LIFECYCLE_STATE_PUBLISHED";
+}
+
+// 출시노트는 edit을 열어야 읽힌다. 같은 서비스 계정으로 진행 중인 업로드의 edit을 무효화하지 않도록
+// 업로드가 끝난 뒤에 나가는 internal 배포 알림에서만 읽는다. 조회가 실패해도 알림은 보낸다.
+async function fetchReleaseNotes(
+  client: Partial<Pick<GooglePlayClient, "getReleaseNotes">>,
+  observation: ReleaseObservation,
+): Promise<ReleaseNote[]> {
+  if (!client.getReleaseNotes) return [];
+  try {
+    return await client.getReleaseNotes(
+      observation.packageName,
+      observation.track,
+      observation.versionCode,
+    );
+  } catch (error) {
+    console.warn(
+      `${observation.packageName} ${observation.versionCode} 출시노트 조회 실패:`,
+      error instanceof Error ? error.message : error,
+    );
+    return [];
+  }
 }
 
 function trackKey(observation: ReleaseObservation): string {

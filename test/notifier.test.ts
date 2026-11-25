@@ -107,6 +107,33 @@ test("내부 테스트 배포 메시지에 버전명과 버전코드를 표시�
   assert.match(message, /버전 1\.2\.3 \(123\)/);
 });
 
+test("출시노트가 있으면 한국어 노트를 메시지 끝에 붙인다", () => {
+  const message = formatMessage({
+    kind: "internal-deployed",
+    previous: null,
+    release: {
+      packageName: "com.example.app",
+      track: "internal",
+      releaseName: "1.4.0",
+      versionCode: 10400,
+      state: "RELEASE_LIFECYCLE_STATE_PUBLISHED",
+    },
+    releaseNotes: [
+      { language: "en-US", text: "New daily totals." },
+      { language: "ko-KR", text: "날짜별 합계를 볼 수 있어요." },
+    ],
+  });
+
+  assert.match(message, /\n\n출시노트\n날짜별 합계를 볼 수 있어요\.$/);
+  assert.doesNotMatch(message, /New daily totals/);
+});
+
+test("출시노트가 없으면 출시노트 줄을 붙이지 않는다", () => {
+  const message = formatMessage(notificationEvent("com.example.app"));
+
+  assert.doesNotMatch(message, /출시노트/);
+});
+
 function notificationEvent(packageName: string): NotificationEvent {
   return {
     kind: "approved",

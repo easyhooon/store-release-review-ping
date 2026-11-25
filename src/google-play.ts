@@ -12,6 +12,11 @@ export interface ReleaseObservation {
   state: LifecycleState;
 }
 
+export interface ReleaseNote {
+  language: string;
+  text: string;
+}
+
 interface ReleaseListResponse {
   releases?: Array<{
     releaseName?: string;
@@ -20,6 +25,17 @@ interface ReleaseListResponse {
     releaseLifecycleState?: unknown;
   }>;
 }
+
+interface EditTrackResponse {
+  releases?: Array<{
+    versionCodes?: string[];
+    releaseNotes?: Array<{ language?: string; text?: string }>;
+  }>;
+}
+
+const apiBase = "https://androidpublisher.googleapis.com/androidpublisher/v3";
+// 요청이 멈추면 알림 전송과 다음 폴링까지 멈추므로 출시노트 조회에는 시간 제한을 둔다
+const releaseNotesTimeoutMs = 15_000;
 
 export class GooglePlayClient {
   private readonly auth = new GoogleAuth({
@@ -55,5 +71,47 @@ export class GooglePlayClient {
         ];
       });
     });
+  }
+
+  // 출시노트는 releases 조회에 없고 edits API에서만 읽힌다. edit은 커밋하지 않고 바로 지운다.
+  async getReleaseNotes(
+    packageName: string,
+    track: string,
+    versionCode: number,
+  ): Promise<ReleaseNote[]> {
+    const client = await this.auth.getClient();
+    const editsUrl = `${apiBase}/applications/${encodeURIComponent(packageName)}/edits`;
+    const edit = await client.request<{ id: string }>({
+      url: editsUrl,
+      method: "POST",
+      data: {},
+      timeout: releaseNotesTimeoutMs,
+    });
+    const editUrl = `${editsUrl}/${encodeURIComponent(edit.data.id)}`;
+
+    try {
+      const response = await client.request<EditTrackResponse>({
+        url: `${editUrl}/tracks/${encodeURIComponent(track)}`,
+        timeout: releaseNotesTimeoutMs,
+      });
+      const release = (response.data.releases ?? []).find((candidate) =>
+        (candidate.versionCodes ?? []).includes(String(versionCode))
+      );
+      return (release?.releaseNotes ?? []).flatMap((note) =>
+        note.language && note.text
+          ? [{ language: note.language, text: note.text }]
+          : []
+      );
+    } finally {
+      // 지우기 실패가 읽은 출시노트나 원래 오류를 덮어쓰지 않게 한다. 남은 edit은 Play가 만료시킨다.
+      await client
+        .request({ url: editUrl, method: "DELETE", timeout: releaseNotesTimeoutMs })
+        .catch((error: unknown) => {
+          console.warn(
+            `${packageName} edit 삭제 실패:`,
+            error instanceof Error ? error.message : error,
+          );
+        });
+    }
   }
 }

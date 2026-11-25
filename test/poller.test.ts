@@ -152,3 +152,79 @@ test("production의 새 게시 버전은 internal 배포 알림을 만들지 않
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("internal 배포 알림에만 출시노트를 붙이고, 조회가 실패해도 알림은 보낸다", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "play-review-ping-"));
+  const config: Config = {
+    pollIntervalSeconds: 180,
+    stateFile: join(directory, "state.json"),
+    apps: [{ packageName: "com.example.app", tracks: ["internal", "production"] }],
+  };
+  let internalVersionCode = 100;
+  let productionState: LifecycleState = "RELEASE_LIFECYCLE_STATE_IN_REVIEW";
+  let notesFail = false;
+  const noteRequests: Array<[string, string, number]> = [];
+  const events: NotificationEvent[] = [];
+  const client = {
+    async listReleases(_packageName: string, track: string): Promise<ReleaseObservation[]> {
+      return track === "internal"
+        ? [{
+          packageName: "com.example.app",
+          track: "internal",
+          releaseName: `1.0.${internalVersionCode - 100}`,
+          versionCode: internalVersionCode,
+          state: "RELEASE_LIFECYCLE_STATE_PUBLISHED",
+        }]
+        : [{
+          packageName: "com.example.app",
+          track: "production",
+          releaseName: "1.0.0",
+          versionCode: 100,
+          state: productionState,
+        }];
+    },
+    async getReleaseNotes(packageName: string, track: string, versionCode: number) {
+      noteRequests.push([packageName, track, versionCode]);
+      if (notesFail) throw new Error("edit 생성 실패");
+      return [{ language: "ko-KR", text: "새 기능을 추가했어요." }];
+    },
+  };
+  const resolveNotifiers = () => [{
+    async send(event: NotificationEvent): Promise<void> {
+      events.push(event);
+    },
+  }];
+  const originalWarn = console.warn;
+  console.warn = () => {};
+
+  try {
+    await pollOnce(config, client, resolveNotifiers);
+    assert.equal(noteRequests.length, 0);
+
+    internalVersionCode = 101;
+    productionState = "RELEASE_LIFECYCLE_STATE_APPROVED_NOT_PUBLISHED";
+    await pollOnce(config, client, resolveNotifiers);
+    assert.deepEqual(noteRequests, [["com.example.app", "internal", 101]]);
+    const internalEvent = events.find((event) => event.kind === "internal-deployed");
+    const approvedEvent = events.find((event) => event.kind === "approved");
+    assert.deepEqual(internalEvent?.releaseNotes, [
+      { language: "ko-KR", text: "새 기능을 추가했어요." },
+    ]);
+    assert.deepEqual(approvedEvent?.releaseNotes, []);
+
+    notesFail = true;
+    internalVersionCode = 102;
+    await pollOnce(config, client, resolveNotifiers);
+    assert.equal(events.length, 3);
+    assert.deepEqual(events[2]?.releaseNotes, []);
+
+    assert.equal(
+      (await pollOnce(config, client, resolveNotifiers)).notifications,
+      0,
+    );
+    assert.equal(events.length, 3);
+  } finally {
+    console.warn = originalWarn;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
