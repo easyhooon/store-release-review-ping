@@ -1,5 +1,5 @@
 import { observeLifecycle, type LifecycleState, type NotificationKind } from "./domain/lifecycle.js";
-import { googleAccessToken, parseServiceAccount } from "./google-jwt.js";
+import { googleAccessToken, parseServiceAccount, type GoogleServiceAccount } from "./google-jwt.js";
 import {
   formatMessage, parseEditTrackReleaseNotes, parseReleaseList,
   type ReleaseNote, type ReleaseObservation,
@@ -58,6 +58,9 @@ const SCOPE = "https://www.googleapis.com/auth/androidpublisher";
 const REQUEST_TIMEOUT_MS = 15_000;
 // 한 실행은 Google 조회(15초 제한) 몇 번과 Discord 전송이 전부라 5분이면 넉넉하다. 15분 Cron과도 겹치지 않는다.
 const LEASE_MS = 300_000;
+// Google access token은 3600초 유효하다. 50분 캐시하고, 남은 시간이 5분 안쪽이면 새로 받는다.
+const TOKEN_CACHE_MS = 50 * 60_000;
+const TOKEN_REFRESH_MARGIN_MS = 5 * 60_000;
 
 export function parsePlayApps(raw: string): PlayAppConfig[] {
   let apps: unknown;
@@ -140,18 +143,23 @@ async function pollApp(
   const now = Date.now();
   await app.db.prepare("INSERT OR IGNORE INTO play_apps (package_name) VALUES (?)").bind(packageName).run();
   const claimed = await app.db.prepare(
-    "UPDATE play_apps SET lease_until = ?, lease_token = ? WHERE package_name = ? AND lease_until < ?",
-  ).bind(now + LEASE_MS, token, packageName, now).run();
-  if (claimed.meta.changes === 0) return { checked: 0, notifications: 0, skipped: true };
+    `UPDATE play_apps SET lease_until = ?, lease_token = ? WHERE package_name = ? AND lease_until < ?
+     RETURNING access_token, token_subject, token_expires_at`,
+  ).bind(now + LEASE_MS, token, packageName, now).first<CachedToken>();
+  if (!claimed) return { checked: 0, notifications: 0, skipped: true };
 
   try {
-    const accessToken = await googleAccessToken(account, SCOPE, fetcher);
+    const accessToken = await cachedAccessToken(app, account, claimed, token, fetcher);
     const google = async (url: string, init: RequestInit = {}): Promise<unknown> => {
       const response = await fetcher(url, {
         ...init,
         headers: { authorization: `Bearer ${accessToken}`, accept: "application/json", ...init.headers },
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
+      if (response.status === 401) {
+        // 키를 바꿨거나 토큰이 폐기됐다. 캐시를 비워 다음 실행에서 새로 받는다.
+        await app.db.prepare("UPDATE play_apps SET token_expires_at = 0 WHERE package_name = ?").bind(packageName).run();
+      }
       if (!response.ok) {
         throw new Error(`Google Play API 실패: HTTP ${response.status} ${init.method ?? "GET"} ${new URL(url).pathname}`);
       }
@@ -266,6 +274,29 @@ async function pollApp(
       console.error("Play lease 해제 실패", error instanceof Error ? error.message : "unknown");
     }
   }
+}
+
+interface CachedToken {
+  access_token: string;
+  token_subject: string;
+  token_expires_at: number;
+}
+
+// 무료 플랜은 실행당 CPU가 10ms라 RS256 서명(약 1–5ms)을 실행마다 하지 않는다. Google access token은
+// 1시간 유효하므로 앱별 D1에 50분 동안 캐시한다. 서비스 계정을 바꾸면(client_email이 다르면) 새로 받는다.
+async function cachedAccessToken(
+  app: PlayApp, account: GoogleServiceAccount, cached: CachedToken, leaseToken: string, fetcher: typeof fetch,
+): Promise<string> {
+  if (cached.access_token && cached.token_subject === account.client_email &&
+      cached.token_expires_at > Date.now() + TOKEN_REFRESH_MARGIN_MS) {
+    return cached.access_token;
+  }
+  const accessToken = await googleAccessToken(account, SCOPE, fetcher);
+  await app.db.prepare(
+    `UPDATE play_apps SET access_token = ?, token_subject = ?, token_expires_at = ?
+     WHERE package_name = ? AND lease_token = ?`,
+  ).bind(accessToken, account.client_email, Date.now() + TOKEN_CACHE_MS, app.packageName, leaseToken).run();
+  return accessToken;
 }
 
 // src/poller.ts의 processObservation과 같은 규칙이다.

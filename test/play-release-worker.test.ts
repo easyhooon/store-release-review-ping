@@ -299,6 +299,38 @@ test("2000자를 넘는 메시지는 Discord 한도에 맞게 코드 포인트 �
   assert.equal(characters.at(-2), "😀");
 });
 
+test("access token은 앱별 D1에 캐시해 실행마다 서명하지 않고, 401이나 서비스 계정 변경 때 새로 받는다", async () => {
+  const f = await fixture();
+  let tokenRequests = 0;
+  let unauthorized = false;
+  const fetcher = (async (input: URL | RequestInfo, init?: RequestInit) => {
+    const url = new URL(String(input));
+    if (url.hostname === "oauth2.googleapis.com") tokenRequests++;
+    if (unauthorized && url.hostname === "androidpublisher.googleapis.com") return new Response("{}", { status: 401 });
+    return f.fetcher(input, init);
+  }) as typeof fetch;
+  f.tracks.production = [{ name: "1.4.0", versionCodes: [10400], state: IN_REVIEW }];
+  await pollPlayReleaseWorker(f.env, fetcher);
+  await pollPlayReleaseWorker(f.env, fetcher);
+  assert.equal(tokenRequests, 1);
+
+  unauthorized = true;
+  await rejectsWith(pollPlayReleaseWorker(f.env, fetcher), /HTTP 401/);
+  unauthorized = false;
+  await pollPlayReleaseWorker(f.env, fetcher);
+  assert.equal(tokenRequests, 2);
+
+  f.env.YEOBEE_GOOGLE_SERVICE_ACCOUNT_JSON = serviceAccount("rotated");
+  await pollPlayReleaseWorker(f.env, fetcher);
+  assert.equal(tokenRequests, 3);
+  assert.equal(f.db.prepare("SELECT token_subject FROM play_apps").get()?.token_subject, "rotated@example.iam.gserviceaccount.com");
+
+  // 50분이 지나면(만료 5분 전 안쪽) 새로 받는다.
+  f.db.prepare("UPDATE play_apps SET token_expires_at = ?").run(Date.now() + 60_000);
+  await pollPlayReleaseWorker(f.env, fetcher);
+  assert.equal(tokenRequests, 4);
+});
+
 test("PLAY_APPS 형식이 틀리면 실행하지 않는다", () => {
   assert.throws(() => parsePlayApps("x"), /JSON 배열/);
   assert.throws(() => parsePlayApps("[]"), /하나 이상/);
@@ -362,6 +394,8 @@ test("앱별 서비스 계정·웹훅·D1을 쓰고, 한 앱이 실패해도 다
   releases["com.yeobee"] = APPROVED;
   releases["com.nexters.bandalart"] = APPROVED;
   failYeobeeToken = true;
+  // 캐시된 토큰이 있으면 서명·발급을 하지 않으므로, 만료시켜 새로 받게 한다.
+  yeobee.raw.prepare("UPDATE play_apps SET token_expires_at = 0").run();
   await rejectsWith(pollPlayReleaseWorker(env, fetcher), /com\.yeobee: Google 토큰 발급 실패: HTTP 400 invalid_grant/);
   assert.deepEqual(posted.map((item) => item.hook), ["/api/webhooks/2/bandalart"]);
   assert.match(posted[0].content, /com\.nexters\.bandalart · production/);

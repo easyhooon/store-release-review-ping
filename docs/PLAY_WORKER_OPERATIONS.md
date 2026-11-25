@@ -25,7 +25,7 @@ Cloudflare 무료 플랜은 계정당 Cron Trigger가 5개입니다. TestFlight,
 | HTTP | 없음(`workers_dev: false`). Google Play에는 심사 상태 웹훅이 없습니다(RTDN은 결제 전용) |
 | D1 | 앱별 D1의 `play_releases`(패키지·트랙·versionCode별 마지막 상태), `play_apps`(lease) |
 
-인증은 `google-auth-library` 대신 `src/google-jwt.ts`가 WebCrypto RS256으로 JWT를 서명해 `https://oauth2.googleapis.com/token`에서 access token을 받습니다. 실행마다 새로 받습니다.
+인증은 `google-auth-library` 대신 `src/google-jwt.ts`가 WebCrypto RS256으로 JWT를 서명해 `https://oauth2.googleapis.com/token`에서 access token을 받습니다. 무료 플랜은 실행당 CPU가 10ms라, 받은 토큰(1시간 유효)을 앱별 D1의 `play_apps.access_token`에 50분 캐시해 실행마다 서명하지 않습니다. 서비스 계정이 바뀌면(`client_email`이 다르면) 새로 받고, Google이 401을 주면 캐시를 비워 다음 실행에서 새로 받습니다. 토큰은 Play Console 권한을 그대로 가지므로 D1 접근 권한을 비밀값처럼 다룹니다.
 
 ## 동작
 
