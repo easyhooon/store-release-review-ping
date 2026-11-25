@@ -1,6 +1,6 @@
 # Google Play 심사 알림 Cloudflare Worker 운영
 
-Google Play 릴리스 심사 상태 알림(`releaseLifecycleState` 전환, Internal Testing 새 버전과 출시노트)은 Mac의 launchd `pnpm watch` 대신 Cloudflare Worker가 보냅니다. Mac을 꺼도 알림이 옵니다. 로컬 `src/cli.ts`는 Worker 장애 때 되살릴 대체 경로로 남겨 둡니다.
+2026-11-25부터 Google Play 릴리스 심사 상태 알림(`releaseLifecycleState` 전환, Internal Testing 새 버전과 출시노트)은 Mac의 launchd `pnpm watch` 대신 Cloudflare Worker가 보냅니다. 같은 날 09:21Z에 로컬 launchd 두 개(`com.mps-jihun-lee.play-review-ping`, `com.easyhooon.bandalart.play-review-ping`)를 중지해 plist를 `~/Library/LaunchAgents/disabled/`로 옮기고, 중지 직후 상태 파일로 D1을 채운 뒤 배포했습니다. Mac을 꺼도 알림이 옵니다. 로컬 `src/cli.ts`는 Worker 장애 때 되살릴 대체 경로로 남겨 둡니다.
 
 ## 구성
 
