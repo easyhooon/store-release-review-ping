@@ -44,6 +44,8 @@ Google Play의 [릴리스 심사 상태 API](https://developers.google.com/andro
 
 ## TestFlight 새 빌드 알림
 
+2026-11-25부터 여비 TestFlight 알림은 Cloudflare Worker `yeobee-testflight-ping`이 담당합니다. 아래 [Cloudflare Worker 운영](#cloudflare-worker-운영)을 참고하세요. 로컬 CLI는 미리보기와 Worker 장애 때 되살릴 대체 경로로 남겨 둡니다.
+
 `src/testflight-cli.ts`는 `GET /v1/builds`(앱별, `-uploadedDate` 정렬, 최근 50개)를 5분마다 읽고, 처리가 끝나 `processingState`가 `VALID`가 된 새 빌드를 Discord에 한 번씩 알립니다. 메시지는 앱 라벨(PRD/DEV), 마케팅 버전, 빌드 번호, TestFlight "테스트할 내용"(`betaBuildLocalizations.whatsNew`, `ko` 우선, 없으면 첫 로캘)을 담습니다. 심사 상태 폴러와 별도 상태 파일을 씁니다.
 
 - `TESTFLIGHT_PING_CONFIG`: `testflight.config.example.json` 형식의 설정 파일 경로(기본 `testflight.config.json`). 앱마다 `appStoreId`, `appName`, `label`, `discordWebhookEnv`를 지정합니다.
@@ -58,3 +60,34 @@ Google Play의 [릴리스 심사 상태 API](https://developers.google.com/andro
 - Discord 전송이 실패하면 기록하지 않아 다음 조회에서 재시도합니다. Apple·Discord 요청에는 15초 타임아웃을 둡니다.
 
 `node --import tsx src/testflight-cli.ts preview`는 앱별 최신 VALID 빌드의 메시지를 콘솔에만 출력하고 상태 파일과 Discord는 건드리지 않습니다. `once`는 한 번 조회, `watch`는 계속 조회합니다.
+
+### Cloudflare Worker 운영
+
+`src/testflight-worker.ts`는 위 로컬 동작을 Cloudflare Worker로 옮긴 것입니다. 설정은 `wrangler.yeobee-testflight.jsonc`입니다.
+
+| 구성 | 내용 |
+| --- | --- |
+| Cron Trigger | 2분마다(`*/2 * * * *`) PRD·DEV 앱을 조회합니다 |
+| 웹훅 | `POST https://yeobee-testflight-ping.mraz3068.workers.dev/apple/build-upload`. 여비 PRD(`6475346701`)·DEV(`6759133612`) 앱에 `BUILD_UPLOAD_STATE_UPDATED`만 등록했고, 두 웹훅은 같은 비밀값을 씁니다 |
+| D1 | `yeobee-ios-webhook-events`의 `testflight_apps`(기준점, lease), `testflight_builds`(본 빌드). `migrations/0002_testflight_builds.sql` |
+| 비밀값 | `APP_STORE_CONNECT_KEY_ID`, `APP_STORE_CONNECT_PRIVATE_KEY`, `DISCORD_WEBHOOK_URL`, `APPLE_WEBHOOK_SECRET` |
+
+웹훅은 업로드 상태가 `COMPLETE`일 때 "지금 한 번 조회하라"는 신호로만 씁니다. 페이로드에 앱 ID와 빌드 처리 상태가 없어, 등록한 앱을 모두 조회합니다. 업로드 직후 빌드가 아직 `PROCESSING`이면 `VALID` 알림은 다음 Cron이 보냅니다. Worker 로그의 `TestFlight webhook notifications=0`이 이 경우입니다.
+
+같은 빌드를 두 번 보내지 않도록 다음 규칙을 둡니다:
+
+- 앱별 lease(120초)를 잡은 실행만 조회합니다. Cron과 웹훅이 겹치면 한쪽은 `skipped`로 건너뜁니다. 빌드를 보낼 때마다 lease를 연장하고, 뺏겼으면 멈춥니다.
+- 보내기 전에 `state = 'SENDING'`으로 기록하고, 성공하면 실제 상태로 바꿉니다. Discord가 4xx(429 포함)로 거절했을 때만 기록을 지워 다시 보냅니다. 타임아웃·네트워크 오류·5xx는 실제로 게시됐을 수 있어 다시 보내지 않습니다.
+- 웹훅 실행은 `waitUntil`이 응답 후 약 30초만 보장되므로, 시작 후 10초가 지나면 새 전송을 시작하지 않고 Cron에 넘깁니다.
+
+그 대가로 전송 도중 실행이 끊기고 Discord도 받지 못한 빌드는 알림이 빠지고 `SENDING`으로 남습니다. 다음 실행 로그에 `전송 확인 안 된 빌드(SENDING)` 경고가 찍힙니다. 확인 쿼리:
+
+```bash
+npx wrangler d1 execute yeobee-ios-webhook-events --remote -c wrangler.yeobee-testflight.jsonc --command "SELECT * FROM testflight_builds WHERE state = 'SENDING'"
+```
+
+로그는 `npx wrangler tail yeobee-testflight-ping`으로 봅니다. 배포는 `npx wrangler deploy -c wrangler.yeobee-testflight.jsonc`입니다.
+
+Worker 장애가 길어지면 보관한 `~/Library/LaunchAgents/disabled/com.easyhooon.yeobee.testflight-ping.plist`를 `~/Library/LaunchAgents/`로 되돌리고 `launchctl bootstrap gui/$(id -u) <plist>`로 로컬 조회를 켭니다. 이때 로컬 상태 파일(`.data/testflight-state.json`)은 2026-11-25 이후 빌드를 모르므로, 그 사이 빌드가 한 번씩 다시 알려질 수 있습니다. 두 경로를 동시에 켜지 않습니다.
+
+비밀값 재발급은 [IOS_WEBHOOK_ARCHITECTURE.md](IOS_WEBHOOK_ARCHITECTURE.md#apple-웹훅-공유-비밀값-재발급) 절차를 따르되, 같은 값을 PRD·DEV 두 웹훅에 모두 넣습니다.
