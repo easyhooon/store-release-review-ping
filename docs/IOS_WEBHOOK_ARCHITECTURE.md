@@ -4,11 +4,11 @@
 
 | 구성 | 상태 |
 | --- | --- |
-| iOS 심사 상태 15분 조회 | 회사 Mac에서 운영 중. 실제 웹훅 전달을 확인할 때까지 유지 |
+| iOS 심사 상태 15분 조회 | 2026-11-25 중단. launchd plist는 `~/Library/LaunchAgents/disabled/`에 보관 |
 | Cloudflare Workers Free | 계정에서 활성 확인. 결제 수단 없음 |
-| Cloudflare Worker, D1 | 배포 결과를 확인한 뒤 이 문서에 기록 |
-| Apple 웹훅 등록과 비밀값 | 운영자가 직접 설정할 단계. 아직 등록·검증되지 않음 |
-| Discord 실제 전달 | 미검증. 별도 승인 없이 테스트 메시지를 보내지 않음 |
+| Cloudflare Worker, D1 | 2026-10-14 배포. 2026-11-25 기준 반다라트 36건, 여비 5건 모두 `delivered` |
+| Apple 웹훅 등록과 비밀값 | 등록 완료. Worker 비밀값 설정됨 |
+| Discord 실제 전달 | D1 `delivered` 기록으로 확인 |
 
 ```mermaid
 flowchart LR
@@ -20,7 +20,6 @@ flowchart LR
   D1 -->|처리할 이벤트| DIS[Discord<br/>#스토어-심사]
   DIS -->|성공| DONE[D1 완료 기록]
   DIS -->|실패| RETRY[503 응답<br/>Apple 재전달 대상]
-  POLL[회사 Mac<br/>15분 iOS 조회] -. 전환 검증 전 병행 .-> DIS
 ```
 
 ## 용어
@@ -75,8 +74,8 @@ D1의 `webhook_events.id` 고유 키를 Apple 이벤트 ID로 사용한다. 같�
 
 - Apple API, D1 또는 Discord가 실패하면 Worker는 503을 반환하고 완료로 기록하지 않는다. 전달 실패는 Apple 전달 기록에서 확인해 재전달한다.
 - 승인된 검증 순서는 공개 경로 확인 → Apple ping 수신·서명 확인 → 실제 상태 전환·Discord 전달 확인이다. 테스트 Discord 메시지는 **정확한 내용과 한 건의 전송을 별도 승인받은 뒤** 보낸다.
-- 실제 Apple 이벤트 수신, Worker 처리 성공, D1 완료 기록, `#스토어-심사` 메시지를 모두 대조한 뒤 회사 Mac의 `ios:watch` 중단을 결정한다.
-- Worker 장애 시 Apple 웹훅 전달 기록을 보존하고 원인을 수정해 재전달한다. 검증 전에는 기존 15분 조회가 계속 알림을 담당한다. 필요하면 Apple 웹훅을 비활성화하고 조회 감시를 유지한다.
+- 실제 Apple 이벤트가 D1에 `delivered`(Discord 전송 성공 뒤에만 기록)로 쌓인 것을 확인한 뒤 2026-11-25에 회사 Mac의 `ios:watch`를 중단했다.
+- Worker 장애 시 Apple 웹훅 전달 기록을 보존하고 원인을 수정해 재전달한다. 장애가 길어지면 보관한 plist를 `~/Library/LaunchAgents/`로 되돌리고 `launchctl bootstrap gui/$(id -u) <plist>`로 15분 조회를 다시 켠다.
 - Android Google Play 심사 알림과 iOS 고객 후기 알림은 이 구성과 별개다.
 
 자세한 Apple API와 로컬 조회 운영법은 [iOS 심사 상태 운영 문서](IOS_STORE_OPERATIONS.md)를 참고한다.

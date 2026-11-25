@@ -1,6 +1,6 @@
 # iOS App Store 심사 상태 알림
 
-`ios:watch`는 App Store Connect의 `GET /v1/apps/{id}/appStoreVersions`를 15분마다 읽고, iOS 버전 리소스의 `appStoreState` 변화를 Discord에 알립니다. 별도 상태 파일을 사용하므로 Google Play 릴리스 감시와 App Store 고객 리뷰 감시에 영향을 주지 않습니다. 이 조회는 이벤트 수신용 서버가 없는 현재 환경의 임시 운영 방식입니다.
+`ios:watch`는 App Store Connect의 `GET /v1/apps/{id}/appStoreVersions`를 15분마다 읽고, iOS 버전 리소스의 `appStoreState` 변화를 Discord에 알립니다. 별도 상태 파일을 사용하므로 Google Play 릴리스 감시와 App Store 고객 리뷰 감시에 영향을 주지 않습니다. 2026-11-25부터 반다라트 알림은 Cloudflare Worker 웹훅 수신기가 담당하고, 이 조회는 중단했습니다. Worker 장애 때 되살릴 대체 경로로 남겨 둡니다.
 
 ## 설정
 
@@ -24,7 +24,7 @@ App Store Connect는 앱 상태 변경 이벤트 `APP_STORE_VERSION_APP_VERSION_
 
 운영 환경 변수는 기존 폴러의 `IOS_STORE_REVIEW_PING_CONFIG`, `APP_STORE_CONNECT_KEY_ID`, `APP_STORE_CONNECT_ISSUER_ID`, `APP_STORE_CONNECT_KEY_PATH`, 설정 파일에서 지정한 Discord 웹훅 변수에 더해 `APPLE_WEBHOOK_SECRET`이 필요합니다. 이 새 공유 비밀값은 Apple 웹훅 등록에도 동일하게 입력합니다. `IOS_STORE_WEBHOOK_PORT`의 기본값은 `8787`, `IOS_STORE_WEBHOOK_DB`의 기본값은 `.data/ios-webhook-events.sqlite`입니다. 값은 저장소나 명령줄 인수에 넣지 마세요.
 
-수신기는 원문 HMAC-SHA256 서명을 검증하고 Apple API에서 버전 ID가 앱 `6743101965`에 속하는지 확인합니다. SQLite는 이벤트 ID와 처리 상태를 영속 기록합니다. 동시 처리에는 2분 임대를 사용하고 Discord 실패 시 임대를 해제해 재처리합니다. Apple ping은 Discord에 보내지 않습니다. 실제 Apple 수신·Discord 전달 확인 전까지 `ios:watch`를 유지합니다. Discord 성공 직후 SQLite 기록이 실패하면 재전달 시 중복이 생길 수 있으므로 Apple 전달 기록과 로컬 로그를 대조합니다.
+수신기는 원문 HMAC-SHA256 서명을 검증하고 Apple API에서 버전 ID가 앱 `6743101965`에 속하는지 확인합니다. SQLite는 이벤트 ID와 처리 상태를 영속 기록합니다. 동시 처리에는 2분 임대를 사용하고 Discord 실패 시 임대를 해제해 재처리합니다. Apple ping은 Discord에 보내지 않습니다. Discord 성공 직후 SQLite 기록이 실패하면 재전달 시 중복이 생길 수 있으므로 Apple 전달 기록과 로컬 로그를 대조합니다.
 
 ### 추후 Cloudflare 이전
 
@@ -36,7 +36,7 @@ App Store Connect는 앱 상태 변경 이벤트 `APP_STORE_VERSION_APP_VERSION_
 - `APP_STORE_CONNECT_KEY_ID`, `APP_STORE_CONNECT_ISSUER_ID`, `APP_STORE_CONNECT_PRIVATE_KEY`: 기존 App Store Connect 팀 키의 ID, Issuer ID, `.p8` 내용. Worker는 앱의 버전 ID를 안전하게 확인하고 버전 문자열을 표시하는 데 사용합니다.
 - `DISCORD_WEBHOOK_URL`: 현재 `#스토어-심사` 채널의 기존 Discord 웹훅 URL.
 
-Apple 웹훅은 앱 `6743101965`에 `APP_STORE_VERSION_APP_VERSION_STATE_UPDATED` 하나만 등록합니다. 등록 직후 Apple의 `POST /v1/webhookPings`로 수신·서명 검증을 확인할 수 있습니다. Ping은 Discord 메시지를 보내지 않습니다. 실제 Discord 전달은 향후 진짜 상태 전환 또는 별도 승인받은 테스트 이벤트로 확인해야 합니다. 그때까지 `ios:watch`를 실행한 채로 둡니다. Apple의 [전달 기록 API](https://developer.apple.com/documentation/appstoreconnectapi/get-v1-webhooks-_id_-deliveries)와 Worker 로그·D1 전달 상태로 결과를 대조한 뒤에만 15분 폴러를 중단합니다. Android Google Play 조회 감시와 iOS 고객 후기 감시는 별도입니다.
+Apple 웹훅은 앱 `6743101965`에 `APP_STORE_VERSION_APP_VERSION_STATE_UPDATED` 하나만 등록합니다. 등록 직후 Apple의 `POST /v1/webhookPings`로 수신·서명 검증을 확인할 수 있습니다. Ping은 Discord 메시지를 보내지 않습니다. D1에 실제 이벤트가 `delivered`(Discord 전송 성공 뒤에만 기록)로 쌓인 것을 확인하고 2026-11-25에 15분 폴러를 중단했습니다. 전달 실패를 조사할 때는 Apple의 [전달 기록 API](https://developer.apple.com/documentation/appstoreconnectapi/get-v1-webhooks-_id_-deliveries)와 Worker 로그·D1을 대조합니다. Android Google Play 조회 감시와 iOS 고객 후기 감시는 별도입니다.
 
 Discord에서 성공 응답이 나온 직후 D1 기록에 실패하는 매우 드문 경우에는 재전송으로 중복 메시지가 생길 수 있습니다. 상태 전환 감시 자체가 실패하지 않도록 재시도를 우선합니다. Apple API, D1 또는 Discord 오류는 HTTP 503으로 드러나며, Apple 전달 기록에서 실패 이벤트를 찾아 재전달할 수 있습니다. [Apple 구성·검증 문서](https://developer.apple.com/documentation/appstoreconnectapi/configuring-webhook-notifications).
 
