@@ -4,6 +4,8 @@ Google Play와 App Store 앱 릴리스의 심사 상태를 감시하고 Slack, D
 
 Play Console 화면을 긁지 않고 공식 Google Play Developer API의 `releaseLifecycleState`를 사용합니다.
 
+여비·반다라트 운영 알림은 Mac의 `pnpm watch` 대신 앱별 Cloudflare Worker(Cron 15분 + D1, `src/play-release-worker.ts`)가 보냅니다. 배포, 상태 이전, 로컬로 되돌리는 방법은 [Play Worker 운영 문서](docs/PLAY_WORKER_OPERATIONS.md)를 참고하세요. 아래 로컬 실행 방법은 연동 검증과 Worker 장애 때의 대체 경로입니다.
+
 반다라트 iOS App Store **심사 상태** 감시는 별도로 구현되어 있습니다. Apple 웹훅을 받는 Cloudflare Workers/D1 수신기가 알림을 담당합니다. 실제 Apple 이벤트와 Discord 전달을 확인해 2026-11-25에 15분 조회(`ios:watch`)를 중단했습니다. iOS **고객 후기** 알림과는 다른 흐름입니다. [구성도와 전환 절차](docs/IOS_WEBHOOK_ARCHITECTURE.md), [iOS 운영 문서](docs/IOS_STORE_OPERATIONS.md)를 참고하세요.
 
 ```text
@@ -160,7 +162,7 @@ pnpm check
 
 - 트랙의 AAB/APK 릴리스 상태만 감시합니다. 스토어 등록정보만 바꾼 제출 전체의 상태는 공개 API로 완전히 조회할 수 없습니다.
 - 공개 공식 문서에서 Google Play 릴리스 심사 상태 웹훅을 확인할 수 없어 API를 조회합니다. [릴리스 상태 API](https://developers.google.com/android-publisher/api-ref/rest/v3/applications.tracks.releases/list)와 [구매·구독용 RTDN](https://developer.android.com/google/play/billing/rtdn-reference)은 별개입니다.
-- 상태 저장은 로컬 JSON 파일입니다. Cloud Run처럼 파일이 영속적이지 않은 환경에는 아직 바로 배포할 수 없습니다.
+- 로컬 실행의 상태 저장은 JSON 파일입니다. 파일이 영속적이지 않은 환경에서는 D1을 쓰는 Cloudflare Worker(`docs/PLAY_WORKER_OPERATIONS.md`)를 씁니다.
 - 웹훅 채널별 재시도와 이메일은 다음 버전 범위입니다.
 
 구체적인 범위는 [`docs/MVP.md`](docs/MVP.md), 구조와 결정은 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), 운영 방법은 [`docs/OPERATIONS.md`](docs/OPERATIONS.md), API 할당량과 복구 절차는 [`docs/QUOTAS.md`](docs/QUOTAS.md)에서 확인할 수 있습니다.
