@@ -1,16 +1,7 @@
-import type {
-  LifecycleState,
-  NotificationKind,
-} from "./domain/lifecycle.js";
 import type { AppConfig } from "./config.js";
-import type { ReleaseNote, ReleaseObservation } from "./google-play.js";
+import { formatMessage, type NotificationEvent } from "./play-format.js";
 
-export interface NotificationEvent {
-  kind: NotificationKind;
-  previous: LifecycleState | null;
-  release: ReleaseObservation;
-  releaseNotes?: ReleaseNote[];
-}
+export { formatMessage, type NotificationEvent } from "./play-format.js";
 
 export interface Notifier {
   send(event: NotificationEvent): Promise<void>;
@@ -23,14 +14,6 @@ type WebhookFetch = (
   url: string,
   init: RequestInit,
 ) => Promise<{ ok: boolean; status: number }>;
-
-const titles: Record<NotificationKind, string> = {
-  "internal-deployed": "🧪 Internal Testing 새 버전 배포",
-  "action-required": "⚠️ 심사 전송 필요",
-  approved: "✅ 심사 승인 완료 — 게시 대기",
-  rejected: "🚨 심사 거절",
-  published: "🚀 Google Play 게시 완료",
-};
 
 export class ConsoleNotifier implements Notifier {
   async send(event: NotificationEvent): Promise<void> {
@@ -105,27 +88,6 @@ export async function notifyAll(
   await Promise.all(notifiers.map((notifier) => notifier.send(event)));
 }
 
-export function formatMessage(event: NotificationEvent): string {
-  const release = event.release;
-  const lines = [
-    `[Google Play Release Review Ping] ${titles[event.kind]}`,
-    `${release.packageName} · ${release.track}`,
-    `버전 ${release.releaseName} (${release.versionCode})`,
-  ];
-  if (event.previous) {
-    lines.push(`${shortState(event.previous)} → ${shortState(release.state)}`);
-  }
-  const note = pickReleaseNote(event.releaseNotes ?? []);
-  if (note) {
-    lines.push("", "출시노트", note.text);
-  }
-  return lines.join("\n");
-}
-
-function pickReleaseNote(notes: ReleaseNote[]): ReleaseNote | undefined {
-  return notes.find((note) => note.language === "ko-KR") ?? notes[0];
-}
-
 function createAppNotifiers(
   app: AppConfig,
   environment: NodeJS.ProcessEnv,
@@ -172,8 +134,4 @@ function webhookBody(platform: WebhookPlatform, message: string): unknown {
       },
     ],
   };
-}
-
-function shortState(state: LifecycleState): string {
-  return state.replace("RELEASE_LIFECYCLE_STATE_", "");
 }
