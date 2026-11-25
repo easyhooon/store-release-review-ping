@@ -49,8 +49,6 @@ const titles: Record<NotificationKind, string> = {
   published: "🚀 Google Play 게시 완료",
 };
 
-const DISCORD_CONTENT_LIMIT = 2000;
-
 /** `applications.tracks.releases.list` 응답을 versionCode별 관측으로 편다. */
 export function parseReleaseList(
   body: unknown,
@@ -101,10 +99,7 @@ export function formatMessage(event: NotificationEvent): string {
   }
   const note = pickReleaseNote(event.releaseNotes ?? []);
   if (note) {
-    // Play 출시노트는 언어당 500자라 보통 넘지 않지만, Discord content는 2000자를 넘으면 영구히 거절된다.
-    const header = [...lines, "", "출시노트", ""].join("\n");
-    const room = DISCORD_CONTENT_LIMIT - header.length;
-    lines.push("", "출시노트", note.text.length > room ? `${note.text.slice(0, room - 1)}…` : note.text);
+    lines.push("", "출시노트", note.text);
   }
   return lines.join("\n");
 }

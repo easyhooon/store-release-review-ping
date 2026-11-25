@@ -165,7 +165,7 @@ test("Discord가 4xx(429 포함)로 거절하면 이전 상태로 되돌려 다�
   f.tracks.internal = [{ name: "1.4.1", versionCodes: [10401], state: PUBLISHED }];
   f.tracks.production = [{ name: "1.4.0", versionCodes: [10400], state: APPROVED }];
   f.state.discordStatus = 429;
-  await rejectsWith(pollPlayReleaseWorker(f.env, f.fetcher), /com\.yeobee: Discord HTTP 429/);
+  await rejectsWith(pollPlayReleaseWorker(f.env, f.fetcher), /com\.yeobee: Discord 전송 실패 2건.*internal\/10401: Discord HTTP 429; production\/10400: Discord HTTP 429/);
   // 처음 본 versionCode는 행을 지우고, 기존 versionCode는 이전 상태로 되돌린다.
   assert.deepEqual(rows(f.db), [
     { track: "internal", version_code: 10400, state: PUBLISHED, sending: 0 },
@@ -253,6 +253,50 @@ test("로컬 상태 파일로 seed하면 같은 상태는 알리지 않고 이�
   assert.deepEqual(Object.keys(exported.observations).sort(),
     ["com.yeobee|internal|10400", "com.yeobee|internal|10401", "com.yeobee|production|10400"]);
   assert.equal(exported.observations["com.yeobee|internal|10400"].observedAt, "2026-11-25T08:06:11.050Z");
+});
+
+test("전송이 실패해도 같은 실행의 알림 없는 관측은 저장해, 다음 전환을 놓치지 않는다", async () => {
+  const f = await fixture();
+  f.tracks.production = [{ name: "1.4.0", versionCodes: [10400], state: IN_REVIEW }];
+  await pollPlayReleaseWorker(f.env, f.fetcher);
+  // 10400 승인 알림은 Discord 404로 실패하고, 같은 실행에서 처음 보인 10401 IN_REVIEW는 저장돼야 한다.
+  f.tracks.production = [
+    { name: "1.4.0", versionCodes: [10400], state: APPROVED },
+    { name: "1.4.1", versionCodes: [10401], state: IN_REVIEW },
+  ];
+  f.state.discordStatus = 404;
+  await rejectsWith(pollPlayReleaseWorker(f.env, f.fetcher), /production\/10400: Discord HTTP 404/);
+  assert.deepEqual(rows(f.db), [
+    { track: "production", version_code: 10400, state: IN_REVIEW, sending: 0 },
+    { track: "production", version_code: 10401, state: IN_REVIEW, sending: 0 },
+  ]);
+  f.state.discordStatus = 200;
+  f.tracks.production = [
+    { name: "1.4.0", versionCodes: [10400], state: APPROVED },
+    { name: "1.4.1", versionCodes: [10401], state: APPROVED },
+  ];
+  assert.equal((await pollPlayReleaseWorker(f.env, f.fetcher)).notifications, 2);
+  assert.equal(f.sent.length, 2);
+});
+
+test("Discord 웹훅 주소가 잘못되면 lease·D1을 건드리기 전에 그 앱만 실패한다", async () => {
+  const f = await fixture();
+  f.env.YEOBEE_DISCORD_WEBHOOK_URL = "\"https://discord.com/api/webhooks/1/x\"";
+  await rejectsWith(pollPlayReleaseWorker(f.env, f.fetcher), /YEOBEE_DISCORD_WEBHOOK_URL이 https:\/\/discord\.com/);
+  assert.equal(f.db.prepare("SELECT COUNT(*) AS n FROM play_apps").get()?.n, 0);
+  assert.equal(rows(f.db).length, 0);
+});
+
+test("2000자를 넘는 메시지는 Discord 한도에 맞게 코드 포인트 단위로 자른다", async () => {
+  const f = await fixture();
+  f.tracks.production = [{ name: "1.4.0", versionCodes: [10400], state: IN_REVIEW }];
+  await pollPlayReleaseWorker(f.env, f.fetcher);
+  f.tracks.production = [{ name: "😀".repeat(2100), versionCodes: [10400], state: APPROVED }];
+  assert.equal((await pollPlayReleaseWorker(f.env, f.fetcher)).notifications, 1);
+  const characters = Array.from(f.sent[0]);
+  assert.equal(characters.length, 2000);
+  assert.equal(characters.at(-1), "…");
+  assert.equal(characters.at(-2), "😀");
 });
 
 test("PLAY_APPS 형식이 틀리면 실행하지 않는다", () => {

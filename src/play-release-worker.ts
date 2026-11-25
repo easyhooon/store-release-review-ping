@@ -122,6 +122,10 @@ function resolveApp(env: PlayReleaseWorkerEnv, config: PlayAppConfig): PlayApp {
       typeof discordWebhookUrl !== "string" || !discordWebhookUrl) {
     throw new Error(`${config.key}_DB, ${config.key}_GOOGLE_SERVICE_ACCOUNT_JSON, ${config.key}_DISCORD_WEBHOOK_URL 중 빠진 설정이 있습니다.`);
   }
+  // sending = 1을 기록한 뒤에 URL 오류가 나면 "게시됐을 수 있음"으로 남아 알림이 영구히 빠진다. lease·D1 쓰기 전에 검사한다.
+  if (!validDiscordWebhook(discordWebhookUrl)) {
+    throw new Error(`${config.key}_DISCORD_WEBHOOK_URL이 https://discord.com/api/webhooks/ 주소가 아닙니다.`);
+  }
   return { db, packageName: config.packageName, tracks: config.tracks, serviceAccountJson, discordWebhookUrl };
 }
 
@@ -172,23 +176,51 @@ async function pollApp(
         stuck.map((row) => `${row.track}/${row.version_code}=${row.state}`).join(", ")}`);
     }
 
-    let notifications = 0;
+    const pending: Array<{ observation: ReleaseObservation; previous: LifecycleState | null; kind: NotificationKind }> = [];
+    const quiet: ReleaseObservation[] = [];
     for (const observation of observations) {
       const previous = (stored.get(releaseKey(observation.track, observation.versionCode))?.state ?? null) as
         LifecycleState | null;
-      const notification = notificationFor(observation, previous, baselineTracks.has(observation.track));
-      if (!notification) continue;
+      const kind = notificationFor(observation, previous, baselineTracks.has(observation.track));
+      if (kind) pending.push({ observation, previous, kind });
+      else quiet.push(observation);
+    }
 
+    // 알림 없는 관측(첫 기준점, IN_REVIEW 등)은 전송보다 먼저 한 쿼리로 저장한다. 전송이 실패해도 이 관측이
+    // 저장돼야 다음 실행에서 IN_REVIEW → APPROVED 같은 전환을 알 수 있다. 무료 플랜은 실행당 D1 쿼리가 50개다.
+    // 상태나 이름이 바뀐 행만 고쳐 D1 쓰기 수를 줄인다.
+    if (quiet.length > 0) {
+      await app.db.prepare(
+        `INSERT INTO play_releases (package_name, track, version_code, state, release_name, observed_at)
+         SELECT ?, json_extract(value, '$.track'), json_extract(value, '$.versionCode'),
+                json_extract(value, '$.state'), json_extract(value, '$.releaseName'), ?
+         FROM json_each(?) WHERE true
+         ON CONFLICT (package_name, track, version_code) DO UPDATE SET
+           state = excluded.state, release_name = excluded.release_name, observed_at = excluded.observed_at,
+           sending = CASE WHEN play_releases.state IS excluded.state THEN play_releases.sending ELSE 0 END,
+           previous_state = CASE WHEN play_releases.state IS excluded.state THEN play_releases.previous_state ELSE NULL END
+         WHERE play_releases.state IS NOT excluded.state OR play_releases.release_name IS NOT excluded.release_name`,
+      ).bind(packageName, new Date().toISOString(), JSON.stringify(quiet.map((observation) => ({
+        track: observation.track,
+        versionCode: observation.versionCode,
+        state: observation.state,
+        releaseName: observation.releaseName,
+      })))).run();
+    }
+
+    let notifications = 0;
+    const sendErrors: string[] = [];
+    for (const { observation, previous, kind } of pending) {
       // 실행이 길어져 lease가 만료되면 다른 실행이 같은 전환을 보낼 수 있다. 보내기 전마다 연장하고, 뺏겼으면 멈춘다.
       const renewed = await app.db.prepare(
         "UPDATE play_apps SET lease_until = ? WHERE package_name = ? AND lease_token = ?",
       ).bind(Date.now() + LEASE_MS, packageName, token).run();
       if (renewed.meta.changes === 0) {
         console.warn(`Play ${packageName} lease를 잃어 남은 처리를 다음 실행에 넘깁니다.`);
-        return { checked: observations.length, notifications, skipped: false };
+        break;
       }
 
-      const releaseNotes = notification === "internal-deployed"
+      const releaseNotes = kind === "internal-deployed"
         ? await fetchReleaseNotes(google, observation)
         : [];
       // 보내기 전에 새 상태와 sending = 1을 기록한다. 전송 후 기록 전에 실행이 잘려도 다음 실행이
@@ -204,13 +236,15 @@ async function pollApp(
         observation.releaseName, new Date().toISOString(), previous).run();
       try {
         await sendDiscord(app.discordWebhookUrl, formatMessage({
-          kind: notification, previous, release: observation, releaseNotes,
+          kind, previous, release: observation, releaseNotes,
         }), fetcher);
       } catch (error) {
         // Discord가 4xx로 거절한 것이 확실할 때만 이전 상태로 되돌려 다음 실행에서 다시 보낸다.
         // 타임아웃·네트워크 오류·5xx는 실제로 게시됐을 수 있어 sending = 1을 남긴다.
+        // 한 알림의 실패가 뒤 알림을 막지 않도록 다음 알림으로 넘어가고, 실패는 끝에서 던진다.
         if (error instanceof DiscordRejected) await revert(app, observation, previous);
-        throw error;
+        sendErrors.push(`${observation.track}/${observation.versionCode}: ${error instanceof Error ? error.message : String(error)}`);
+        continue;
       }
       await app.db.prepare(
         `UPDATE play_releases SET sending = 0, previous_state = NULL
@@ -218,26 +252,8 @@ async function pollApp(
       ).bind(packageName, observation.track, observation.versionCode).run();
       notifications++;
     }
-
-    // 알림 없는 관측(첫 기준점, IN_REVIEW 등)은 한 쿼리로 저장한다. 무료 플랜은 실행당 D1 쿼리가 50개다.
-    // 상태나 이름이 바뀐 행만 고쳐 D1 쓰기 수를 줄인다.
-    if (observations.length > 0) {
-      await app.db.prepare(
-        `INSERT INTO play_releases (package_name, track, version_code, state, release_name, observed_at)
-         SELECT ?, json_extract(value, '$.track'), json_extract(value, '$.versionCode'),
-                json_extract(value, '$.state'), json_extract(value, '$.releaseName'), ?
-         FROM json_each(?) WHERE true
-         ON CONFLICT (package_name, track, version_code) DO UPDATE SET
-           state = excluded.state, release_name = excluded.release_name, observed_at = excluded.observed_at,
-           sending = CASE WHEN play_releases.state IS excluded.state THEN play_releases.sending ELSE 0 END,
-           previous_state = CASE WHEN play_releases.state IS excluded.state THEN play_releases.previous_state ELSE NULL END
-         WHERE play_releases.state IS NOT excluded.state OR play_releases.release_name IS NOT excluded.release_name`,
-      ).bind(packageName, new Date().toISOString(), JSON.stringify(observations.map((observation) => ({
-        track: observation.track,
-        versionCode: observation.versionCode,
-        state: observation.state,
-        releaseName: observation.releaseName,
-      })))).run();
+    if (sendErrors.length > 0) {
+      throw new Error(`Discord 전송 실패 ${sendErrors.length}건 (알림 ${notifications}건 전송): ${sendErrors.join("; ")}`);
     }
     return { checked: observations.length, notifications, skipped: false };
   } finally {
@@ -323,18 +339,35 @@ async function fetchReleaseNotes(
 }
 
 async function sendDiscord(webhookUrl: string, content: string, fetcher: typeof fetch): Promise<void> {
+  if (!validDiscordWebhook(webhookUrl)) throw new Error("Invalid Discord endpoint");
   const url = new URL(webhookUrl);
-  if (url.protocol !== "https:" || url.hostname !== "discord.com" ||
-      !url.pathname.startsWith("/api/webhooks/")) throw new Error("Invalid Discord endpoint");
   url.searchParams.set("wait", "true");
   const response = await fetcher(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ content, allowed_mentions: { parse: [] } }),
+    body: JSON.stringify({ content: fitDiscordContent(content), allowed_mentions: { parse: [] } }),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (response.status >= 400 && response.status < 500) throw new DiscordRejected(response.status);
   if (!response.ok) throw new Error(`Discord HTTP ${response.status}`);
+}
+
+function validDiscordWebhook(raw: string): boolean {
+  try {
+    const url = new URL(raw);
+    return url.protocol === "https:" && url.hostname === "discord.com" && url.pathname.startsWith("/api/webhooks/");
+  } catch {
+    return false;
+  }
+}
+
+// Discord content는 2000자를 넘으면 4xx로 거절돼 매 실행 되돌리고 재시도하게 된다. 코드 포인트 단위로 자른다.
+const DISCORD_CONTENT_LIMIT = 2000;
+function fitDiscordContent(content: string): string {
+  const characters = Array.from(content);
+  return characters.length <= DISCORD_CONTENT_LIMIT
+    ? content
+    : `${characters.slice(0, DISCORD_CONTENT_LIMIT - 1).join("")}…`;
 }
 
 /** Discord가 요청을 받고 4xx로 거절했다. 메시지는 게시되지 않았다. */
