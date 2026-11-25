@@ -5,4 +5,5 @@ dist/
 coverage/
 watch.config.json
 ios-store.config.json
+testflight.config.json
 *.log

@@ -15,6 +15,9 @@
     "watch": "node --env-file-if-exists=.env --import tsx src/cli.ts watch",
     "ios:once": "node --import tsx src/ios-store-cli.ts once",
     "ios:watch": "node --import tsx src/ios-store-cli.ts watch",
+    "testflight:once": "node --import tsx src/testflight-cli.ts once",
+    "testflight:preview": "node --import tsx src/testflight-cli.ts preview",
+    "testflight:watch": "node --import tsx src/testflight-cli.ts watch",
     "ios:webhook": "node --experimental-sqlite --env-file-if-exists=.env --import tsx src/ios-webhook-local-cli.ts",
     "test": "node --experimental-sqlite --import tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit"

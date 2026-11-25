@@ -1,0 +1,18 @@
+{
+  "pollIntervalSeconds": 300,
+  "stateFile": ".data/testflight-state.json",
+  "apps": [
+    {
+      "appStoreId": "6475346701",
+      "appName": "여비",
+      "label": "PRD",
+      "discordWebhookEnv": "DISCORD_WEBHOOK_URL_YEOBEE_IOS"
+    },
+    {
+      "appStoreId": "6759133612",
+      "appName": "여비",
+      "label": "DEV",
+      "discordWebhookEnv": "DISCORD_WEBHOOK_URL_YEOBEE_IOS"
+    }
+  ]
+}

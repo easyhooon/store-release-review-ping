@@ -41,3 +41,20 @@ Apple 웹훅은 앱 `6743101965`에 `APP_STORE_VERSION_APP_VERSION_STATE_UPDATED
 Discord에서 성공 응답이 나온 직후 D1 기록에 실패하는 매우 드문 경우에는 재전송으로 중복 메시지가 생길 수 있습니다. 상태 전환 감시 자체가 실패하지 않도록 재시도를 우선합니다. Apple API, D1 또는 Discord 오류는 HTTP 503으로 드러나며, Apple 전달 기록에서 실패 이벤트를 찾아 재전달할 수 있습니다. [Apple 구성·검증 문서](https://developer.apple.com/documentation/appstoreconnectapi/configuring-webhook-notifications).
 
 Google Play의 [릴리스 심사 상태 API](https://developers.google.com/android-publisher/api-ref/rest/v3/applications.tracks.releases/list)는 조회 API입니다. 공개된 [Real-time Developer Notifications](https://developer.android.com/google/play/billing/rtdn-reference)는 구매·구독 이벤트용이므로 현재 Android 심사 감시는 조회 방식을 유지합니다.
+
+## TestFlight 새 빌드 알림
+
+`src/testflight-cli.ts`는 `GET /v1/builds`(앱별, `-uploadedDate` 정렬, 최근 50개)를 5분마다 읽고, 처리가 끝나 `processingState`가 `VALID`가 된 새 빌드를 Discord에 한 번씩 알립니다. 메시지는 앱 라벨(PRD/DEV), 마케팅 버전, 빌드 번호, TestFlight "테스트할 내용"(`betaBuildLocalizations.whatsNew`, `ko` 우선, 없으면 첫 로캘)을 담습니다. 심사 상태 폴러와 별도 상태 파일을 씁니다.
+
+- `TESTFLIGHT_PING_CONFIG`: `testflight.config.example.json` 형식의 설정 파일 경로(기본 `testflight.config.json`). 앱마다 `appStoreId`, `appName`, `label`, `discordWebhookEnv`를 지정합니다.
+- `APP_STORE_CONNECT_KEY_TYPE`: `team`(기본) 또는 `individual`. 개인 키는 Issuer ID 없이 `sub: "user"` JWT로 서명합니다.
+- `APP_STORE_CONNECT_KEY_ID`, `APP_STORE_CONNECT_KEY_PATH`, 팀 키일 때 `APP_STORE_CONNECT_ISSUER_ID`.
+
+동작:
+
+- 앱별 첫 조회는 기준점만 저장하고 보내지 않습니다. 이때 `PROCESSING` 빌드는 기준점에 넣지 않아, 처리가 끝나면 알립니다.
+- 새 빌드는 오래된 순서로 보냅니다. `FAILED`·`INVALID` 빌드는 알리지 않고 기록만 합니다.
+- 업데이트노트는 전송 직전에 따로 조회합니다. 조회가 실패하거나 비어 있으면 노트 없이 보냅니다. 업로드 도구가 처리 완료 뒤에 노트를 입력하면 첫 알림에는 노트가 빠질 수 있습니다.
+- Discord 전송이 실패하면 기록하지 않아 다음 조회에서 재시도합니다. Apple·Discord 요청에는 15초 타임아웃을 둡니다.
+
+`node --import tsx src/testflight-cli.ts preview`는 앱별 최신 VALID 빌드의 메시지를 콘솔에만 출력하고 상태 파일과 Discord는 건드리지 않습니다. `once`는 한 번 조회, `watch`는 계속 조회합니다.
