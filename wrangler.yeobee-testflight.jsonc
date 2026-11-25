@@ -1,0 +1,21 @@
+// 여비 TestFlight 새 빌드 알림. 2분마다 App Store Connect를 조회하고, POST /apple/build-upload 웹훅을 받으면 바로 한 번 더 조회한다.
+// 비밀값: APP_STORE_CONNECT_KEY_ID, APP_STORE_CONNECT_PRIVATE_KEY, DISCORD_WEBHOOK_URL, APPLE_WEBHOOK_SECRET
+{
+  "name": "yeobee-testflight-ping",
+  "main": "src/testflight-worker.ts",
+  "compatibility_date": "2026-10-13",
+  "triggers": { "crons": ["*/2 * * * *"] },
+  "vars": {
+    "APP_NAME": "여비",
+    "APP_STORE_CONNECT_KEY_TYPE": "individual",
+    "TESTFLIGHT_APPS": "[{\"appStoreId\":\"6475346701\",\"label\":\"PRD\"},{\"appStoreId\":\"6759133612\",\"label\":\"DEV\"}]"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "yeobee-ios-webhook-events",
+      "database_id": "6110acda-08f3-4b62-beff-e7fead574212",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

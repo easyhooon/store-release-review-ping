@@ -1,3 +1,5 @@
+import { appleWorkerToken } from "./apple-jwt.js";
+import { validSignature } from "./apple-webhook-signature.js";
 import { formatIosStoreMessage } from "./ios-store-message.js";
 
 interface Statement {
@@ -131,18 +133,6 @@ export async function handleAppleWebhook(
   }
 }
 
-async function validSignature(body: ArrayBuffer, header: string | null, secret: string): Promise<boolean> {
-  const match = /^hmacsha256=([a-fA-F0-9]{64})$/.exec(header ?? "");
-  if (!match) return false;
-  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const expected = new Uint8Array(await crypto.subtle.sign("HMAC", key, body));
-  const supplied = Uint8Array.from(match[1]!.match(/../g)!, (pair) => Number.parseInt(pair, 16));
-  let difference = 0;
-  for (let i = 0; i < expected.length; i++) difference |= expected[i]! ^ supplied[i]!;
-  return difference === 0;
-}
-
 function validKeyConfig(env: WebhookEnv): boolean {
   const type = env.APP_STORE_CONNECT_KEY_TYPE ?? "team";
   if (type === "individual") return true;
@@ -150,7 +140,7 @@ function validKeyConfig(env: WebhookEnv): boolean {
 }
 
 async function resolveVersion(versionId: string, env: WebhookEnv, fetcher: typeof fetch): Promise<string | null> {
-  const token = await appleToken(env);
+  const token = await appleWorkerToken(env);
   const url = new URL(`https://api.appstoreconnect.apple.com/v1/apps/${env.APP_STORE_ID}/appStoreVersions`);
   url.searchParams.set("filter[platform]", "IOS");
   url.searchParams.set("fields[appStoreVersions]", "platform,versionString");
@@ -173,27 +163,6 @@ async function resolveVersion(versionId: string, env: WebhookEnv, fetcher: typeo
     url.search = next.search;
   }
   throw new Error("Apple API page limit exceeded");
-}
-
-async function appleToken(env: WebhookEnv): Promise<string> {
-  const encode = (value: unknown) => btoa(JSON.stringify(value))
-    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  const issued = Math.floor(Date.now() / 1000);
-  // 팀 키는 iss(Issuer ID), 개인 키는 sub: "user"로 서명한다.
-  const subject = env.APP_STORE_CONNECT_KEY_TYPE === "individual"
-    ? { sub: "user" } : { iss: env.APP_STORE_CONNECT_ISSUER_ID };
-  const unsigned = `${encode({ alg: "ES256", kid: env.APP_STORE_CONNECT_KEY_ID, typ: "JWT" })}.${encode({
-    ...subject, iat: issued, exp: issued + 1200, aud: "appstoreconnect-v1",
-  })}`;
-  const pem = env.APP_STORE_CONNECT_PRIVATE_KEY.replace(/-----BEGIN PRIVATE KEY-----|-----END PRIVATE KEY-----|\s/g, "");
-  const bytes = Uint8Array.from(atob(pem), (c) => c.charCodeAt(0));
-  const key = await crypto.subtle.importKey("pkcs8", bytes, { name: "ECDSA", namedCurve: "P-256" },
-    false, ["sign"]);
-  const signature = new Uint8Array(await crypto.subtle.sign(
-    { name: "ECDSA", hash: "SHA-256" }, key, new TextEncoder().encode(unsigned),
-  ));
-  const encoded = btoa(String.fromCharCode(...signature)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  return `${unsigned}.${encoded}`;
 }
 
 export default {
